@@ -305,43 +305,74 @@ def get_sales_metrics_for_person(
 
 
 def get_total_sales_for_person(
-    G: nx.DiGraph, person_id: str
+    G: nx.DiGraph,
+    person_id: str,
+    year: Optional[int] = None,
+    quarter: Optional[int] = None,
 ) -> float:
     """
-    Sum all sales metrics for the given person.
+    Sum sales metrics for the given person, optionally filtered by year/quarter.
     """
+    y = year if year is not None else config.SALES_DEFAULT_YEAR
+    q = quarter if quarter is not None else config.SALES_DEFAULT_QUARTER
+    allowed_months = _quarter_months(q) if q else None
+
     metrics = get_sales_metrics_for_person(G, person_id)
-    return float(sum(m.get("amount_usd", 0.0) for m in metrics))
-
-
-def get_total_sales_for_department(
-    G: nx.DiGraph, department_id: str
-) -> float:
-    """
-    Sum all sales metrics for all people belonging to a department.
-    """
-    team = get_department_team(G, department_id)
     total = 0.0
-    for person in team:
-        total += get_total_sales_for_person(G, person["id"])
+    for m in metrics:
+        if int(m.get("year", 0)) != y:
+            continue
+        if allowed_months is not None and int(m.get("month", 0)) not in allowed_months:
+            continue
+        total += float(m.get("amount_usd", 0.0))
     return float(total)
 
 
-@traceable(name="get_q3_2024_total_sales")
-def get_q3_2024_total_sales(G: nx.DiGraph) -> float:
+def get_total_sales_for_department(
+    G: nx.DiGraph,
+    department_id: str,
+    year: Optional[int] = None,
+    quarter: Optional[int] = None,
+) -> float:
     """
-    Compute the total Q3 2024 sales across all SalesMetric nodes in the graph.
+    Sum sales metrics for all people in the department, optionally filtered by year/quarter.
+    """
+    team = get_department_team(G, department_id)
+    return sum(
+        get_total_sales_for_person(G, p["id"], year=year, quarter=quarter)
+        for p in team
+    )
 
-    This is slightly more generic than summing per person and matches how
-    you'd aggregate in a graph database.
+
+def _quarter_months(quarter: int) -> Tuple[int, ...]:
+    """Months (1–12) for quarter 1–4."""
+    return {1: (1, 2, 3), 2: (4, 5, 6), 3: (7, 8, 9), 4: (10, 11, 12)}.get(
+        quarter, (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    )
+
+
+@traceable(name="get_total_sales")
+def get_total_sales(
+    G: nx.DiGraph,
+    year: Optional[int] = None,
+    quarter: Optional[int] = None,
+) -> float:
     """
+    Sum sales across all SalesMetric nodes, optionally filtered by year and/or quarter.
+    Uses config.SALES_DEFAULT_YEAR and SALES_DEFAULT_QUARTER when not specified.
+    """
+    y = year if year is not None else config.SALES_DEFAULT_YEAR
+    q = quarter if quarter is not None else config.SALES_DEFAULT_QUARTER
+    allowed_months = _quarter_months(q) if q else None
+
     total = 0.0
     for node_id, attrs in G.nodes(data=True):
         if attrs.get("type") == "SalesMetric":
-            year = attrs.get("year")
-            if year == 2024:
-                # Our data only covers Q3, but this filter is easy to extend.
-                total += float(attrs.get("amount_usd", 0.0))
+            if attrs.get("year") != y:
+                continue
+            if allowed_months is not None and int(attrs.get("month", 0)) not in allowed_months:
+                continue
+            total += float(attrs.get("amount_usd", 0.0))
     return float(total)
 
 
@@ -409,10 +440,12 @@ def get_sales_by_product_for_person(
     person_id: str,
     year: Optional[int] = None,
     month: Optional[str] = None,
+    quarter: Optional[int] = None,
     db_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """
     Return sales breakdown by product for a person (total_usd and transaction_count).
+    Filter by year, month, and/or quarter (takes precedence over month when both set).
     """
     path = db_path or SQLITE_DB_PATH
     if not path.exists():
@@ -435,7 +468,11 @@ def get_sales_by_product_for_person(
     if year is not None:
         sql += " AND t.year = ?"
         params.append(year)
-    if month is not None:
+    if quarter is not None:
+        q_months = [f"{m:02d}" for m in _quarter_months(quarter)]
+        sql += f" AND t.month IN ({','.join('?' * len(q_months))})"
+        params.extend(q_months)
+    elif month is not None:
         sql += " AND t.month = ?"
         params.append(month)
     sql += " GROUP BY p.id, p.name, p.category ORDER BY total_usd DESC"
@@ -460,11 +497,13 @@ def get_sales_by_campaign_for_person(
     person_id: str,
     year: Optional[int] = None,
     month: Optional[str] = None,
+    quarter: Optional[int] = None,
     db_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """
     Return sales attribution by marketing campaign for a person (total_usd and
     transaction_count). Only transactions with a non-null campaign are included.
+    Filter by year, month, and/or quarter (takes precedence over month when both set).
     """
     path = db_path or SQLITE_DB_PATH
     if not path.exists():
@@ -487,7 +526,11 @@ def get_sales_by_campaign_for_person(
     if year is not None:
         sql += " AND t.year = ?"
         params.append(year)
-    if month is not None:
+    if quarter is not None:
+        q_months = [f"{m:02d}" for m in _quarter_months(quarter)]
+        sql += f" AND t.month IN ({','.join('?' * len(q_months))})"
+        params.extend(q_months)
+    elif month is not None:
         sql += " AND t.month = ?"
         params.append(month)
     sql += " GROUP BY c.id, c.name ORDER BY total_usd DESC"
@@ -584,33 +627,44 @@ def format_org_summary(G: nx.DiGraph) -> str:
     return "\n".join(lines)
 
 
+def _format_period_label(year: int, quarter: int) -> str:
+    """e.g. 'Q3 2024'."""
+    return f"Q{quarter} {year}"
+
+
 @traceable(name="format_sales_overview")
 def format_sales_overview(
     G: nx.DiGraph,
+    year: Optional[int] = None,
+    quarter: Optional[int] = None,
     include_transaction_summary: bool = True,
     db_path: Optional[Path] = None,
 ) -> str:
     """
-    Produce a company-wide sales overview for Q3 2024: total sales, per-person
-    totals, and optionally by department and transaction-level summary.
-    Used when the user asks about sales figures, revenue, or performance in general.
+    Produce a company-wide sales overview for the given period: total sales,
+    per-person totals, and optionally by department and transaction-level summary.
+    Uses config.SALES_DEFAULT_YEAR and SALES_DEFAULT_QUARTER when not specified.
     """
-    total_q3 = get_q3_2024_total_sales(G)
+    y = year if year is not None else config.SALES_DEFAULT_YEAR
+    q = quarter if quarter is not None else config.SALES_DEFAULT_QUARTER
+    period = _format_period_label(y, q)
+
+    total = get_total_sales(G, year=y, quarter=q)
     lines = [
-        f"Q3 2024 total sales (all employees): ${total_q3:,.2f}",
+        f"{period} total sales (all employees): ${total:,.2f}",
         "",
-        "Sales by person (Q3 2024):",
+        f"Sales by person ({period}):",
     ]
     people = list_people(G)
     for person in people:
         pid = person["id"]
-        person_total = get_total_sales_for_person(G, pid)
+        person_total = get_total_sales_for_person(G, pid, year=y, quarter=q)
         if person_total > 0:
             lines.append(f"  - {person['name']} ({person.get('role', '')}): ${person_total:,.2f}")
     lines.append("")
-    lines.append("Sales by department (Q3 2024):")
+    lines.append(f"Sales by department ({period}):")
     for dept in list_departments(G):
-        dept_total = get_total_sales_for_department(G, dept["id"])
+        dept_total = get_total_sales_for_department(G, dept["id"], year=y, quarter=q)
         if dept_total > 0:
             lines.append(f"  - {dept['name']}: ${dept_total:,.2f}")
 
@@ -620,34 +674,42 @@ def format_sales_overview(
             conn = sqlite3.connect(path)
             cur = conn.cursor()
             if _sales_tables_exist(cur):
+                # month is TEXT in DB (e.g. '07','08','09')
+                q_months = _quarter_months(q)
+                month_vals = [f"{m:02d}" for m in q_months]
+                placeholders = ",".join("?" * len(month_vals))
                 cur.execute(
-                    """
+                    f"""
                     SELECT p.name, SUM(t.amount_usd) AS total
                     FROM sales_transactions t
                     JOIN products p ON p.id = t.product_id
+                    WHERE t.year = ? AND t.month IN ({placeholders})
                     GROUP BY p.id ORDER BY total DESC LIMIT 5
-                    """
+                    """,
+                    [y] + month_vals,
                 )
                 product_rows = cur.fetchall()
                 cur.execute(
-                    """
+                    f"""
                     SELECT c.name, SUM(t.amount_usd) AS total
                     FROM sales_transactions t
                     JOIN marketing_campaigns c ON c.id = t.marketing_campaign_id
                     WHERE t.marketing_campaign_id IS NOT NULL
+                      AND t.year = ? AND t.month IN ({placeholders})
                     GROUP BY c.id ORDER BY total DESC LIMIT 5
-                    """
+                    """,
+                    [y] + month_vals,
                 )
                 campaign_rows = cur.fetchall()
                 conn.close()
                 if product_rows:
                     lines.append("")
-                    lines.append("Top product categories (Q3 2024):")
+                    lines.append(f"Top product categories ({period}):")
                     for name, amt in product_rows:
                         lines.append(f"  - {name}: ${float(amt):,.2f}")
                 if campaign_rows:
                     lines.append("")
-                    lines.append("Sales attributed to marketing campaigns (Q3 2024):")
+                    lines.append(f"Sales attributed to marketing campaigns ({period}):")
                     for name, amt in campaign_rows:
                         lines.append(f"  - {name}: ${float(amt):,.2f}")
 
@@ -658,14 +720,22 @@ def format_sales_overview(
 def format_person_sales_summary(
     G: nx.DiGraph,
     person_id: str,
+    year: Optional[int] = None,
+    quarter: Optional[int] = None,
     include_transaction_breakdown: bool = True,
     db_path: Optional[Path] = None,
 ) -> str:
     """
-    Produce a text summary of an employee's Q3 2024 sales performance.
+    Produce a text summary of an employee's sales performance for the given period.
+    Uses config.SALES_DEFAULT_YEAR and SALES_DEFAULT_QUARTER when not specified.
     When transaction data exists in SQLite, includes breakdown by product
     and attribution to marketing campaigns.
     """
+    y = year if year is not None else config.SALES_DEFAULT_YEAR
+    q = quarter if quarter is not None else config.SALES_DEFAULT_QUARTER
+    period = _format_period_label(y, q)
+    allowed_months = _quarter_months(q) if q else None
+
     person = get_node(G, person_id)
     if not person:
         return f"No data found for person_id={person_id}"
@@ -677,15 +747,19 @@ def format_person_sales_summary(
     lines = [f"Sales summary for {person['name']} ({person_id}):"]
     total = 0.0
     for m in metrics:
-        year = m.get("year")
-        month = m.get("month")
+        my = int(m.get("year", 0))
+        mm = int(m.get("month", 0)) if str(m.get("month", "")).isdigit() else 0
+        if my != y or (allowed_months is not None and mm not in allowed_months):
+            continue
         amt = float(m.get("amount_usd", 0.0))
         total += amt
-        lines.append(f"  - {year}-{month}: ${amt:,.2f}")
-    lines.append(f"Total Q3 2024 sales: ${total:,.2f}")
+        lines.append(f"  - {my}-{m.get('month')}: ${amt:,.2f}")
+    lines.append(f"Total {period} sales: ${total:,.2f}")
 
     if include_transaction_breakdown:
-        by_product = get_sales_by_product_for_person(person_id, db_path=db_path)
+        by_product = get_sales_by_product_for_person(
+            person_id, year=y, quarter=q, db_path=db_path
+        )
         if by_product:
             lines.append("\nBreakdown by product:")
             for row in by_product:
@@ -693,7 +767,9 @@ def format_person_sales_summary(
                     f"  - {row['product_name']} ({row['product_category']}): "
                     f"${row['total_usd']:,.2f} ({row['transaction_count']} tx)"
                 )
-        by_campaign = get_sales_by_campaign_for_person(person_id, db_path=db_path)
+        by_campaign = get_sales_by_campaign_for_person(
+            person_id, year=y, quarter=q, db_path=db_path
+        )
         if by_campaign:
             lines.append("\nAttribution to marketing campaigns:")
             for row in by_campaign:

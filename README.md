@@ -32,7 +32,7 @@ You get a single repo that demonstrates **routing**, **hybrid context** (graph +
                          │
                          ▼
               ┌──────────────────────┐
-              │  Chat router (LCEL)   │  RunnableBranch
+              │  Chat router (LCEL)  │  RunnableBranch
               │  is_graph_query()?   │
               └──────────┬───────────┘
                          │
@@ -40,13 +40,13 @@ You get a single repo that demonstrates **routing**, **hybrid context** (graph +
          │                               │
          ▼                               ▼
 ┌─────────────────────┐       ┌─────────────────────┐
-│  Vector RAG chain    │       │  Graph RAG chain     │
-│  (document-based)    │       │  (graph + optional   │
-│                     │       │   vector for sales)  │
+│  Vector RAG chain   │       │  Graph RAG chain    │
+│  (document-based)   │       │  (graph + optional  │
+│                     │       │   vector for sales) │
 │ • classify → filter │       │                     │
-│ • FAISS retrieval   │       │ • build context      │
-│ • prompt | LLM      │       │ • optional vector    │
-│ • stream answer     │       │ • prompt | LLM       │
+│ • FAISS retrieval   │       │ • build context     │
+│ • prompt | LLM      │       │ • optional vector   │
+│ • stream answer     │       │ • prompt | LLM      │
 └─────────────────────┘       └─────────────────────┘
          │                               │
          └───────────────┬───────────────┘

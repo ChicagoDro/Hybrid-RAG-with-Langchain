@@ -51,7 +51,6 @@ from src.RAG_chatbot.graph_retrieval import (
     format_org_summary,
     format_person_sales_summary,
     format_sales_overview,
-    get_q3_2024_total_sales,
     list_products,
     list_marketing_campaigns,
 )
@@ -292,7 +291,7 @@ def setup_rag_chain():
     parser = JsonOutputParser(pydantic_object=DocumentCategory)
     classification_chain = (
         CLASSIFICATION_PROMPT | llm | parser
-    ).with_config(run_name="document_classification")
+    ).with_config(run_name="vector_classify_document_type")
 
     valid_categories = {
         "HR Policy",
@@ -425,28 +424,26 @@ def setup_rag_chain():
     # ---------------- Final LCEL chain (answer + sources) ----------------------
 
     retriever = RunnableLambda(retrieve_with_scores).with_config(
-        run_name="vector_retrieval_with_scores"
+        run_name="vector_retrieve"
     )
 
-    # Named step so LangSmith trace shows "vector_rag_classify"
     classify_and_passthrough = RunnableParallel(
         query=RunnablePassthrough(),
         classification={"query": RunnablePassthrough()} | classification_chain,
-    ).with_config(run_name="vector_rag_classify")
+    ).with_config(run_name="vector_classify")
 
-    # Named step for the answer + sources merge
     answer_and_sources = RunnableParallel(
         answer=(ANSWER_PROMPT | llm | StrOutputParser()).with_config(
-            run_name="vector_rag_llm"
+            run_name="vector_generate"
         ),
         sources=itemgetter("sources"),
-    ).with_config(run_name="vector_rag_answer_and_sources")
+    ).with_config(run_name="vector_answer")
 
     rag_chain = (
         classify_and_passthrough
         | retriever
         | answer_and_sources
-    ).with_config(run_name="vector_rag_chain")
+    ).with_config(run_name="vector_chain")
 
     return rag_chain, loaded_vectorstore
 
@@ -570,7 +567,7 @@ SALES_TOKENS = {
 SALES_PERFORMANCE_TOKENS = {"sold", "most", "top", "best", "highest", "leader", "leading"}
 
 
-@traceable(name="graph_query_router")
+@traceable(name="main_route_graph_vs_vector")
 def is_graph_query(user_input: str) -> bool:
     """
     Fuzzy-ish router for graph questions.
@@ -690,7 +687,7 @@ def _graph_build_context(query: str, G: Any) -> Dict[str, Any]:
     }
 
 
-@traceable(name="graph_optional_vector_context")
+@traceable(name="graph_augment_sales")
 def _graph_add_vector_context(state: Dict[str, Any], vectorstore: Any) -> Dict[str, Any]:
     """
     Step 2: For sales context, optionally add product/marketing vector retrieval.
@@ -713,7 +710,7 @@ def _graph_add_vector_context(state: Dict[str, Any], vectorstore: Any) -> Dict[s
     return {**state, "vector_context": vector_context, "sources": sources}
 
 
-@traceable(name="graph_answer_llm")
+@traceable(name="graph_answer")
 def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Step 3: Combine context, run LLM, return {answer, sources}.
@@ -761,7 +758,7 @@ def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
 
     llm = get_llm()
     chain = (graph_prompt | llm | StrOutputParser()).with_config(
-        run_name="graph_answer_llm_invoke"
+        run_name="graph_generate"
     )
     answer_text = chain.invoke(
         {"query": state["user_query"], "graph_context": combined}
@@ -781,10 +778,10 @@ def build_graph_rag_chain(G: Any, vectorstore: Any = None):
         return _graph_add_vector_context(state, vectorstore)
 
     step1_r = RunnableLambda(step1).with_config(run_name="graph_build_context")
-    step2_r = RunnableLambda(step2).with_config(run_name="graph_optional_vector_context")
-    step3_r = RunnableLambda(_graph_answer_llm).with_config(run_name="graph_answer_llm")
+    step2_r = RunnableLambda(step2).with_config(run_name="graph_augment_sales")
+    step3_r = RunnableLambda(_graph_answer_llm).with_config(run_name="graph_answer")
 
-    return (step1_r | step2_r | step3_r).with_config(run_name="graph_rag_chain")
+    return (step1_r | step2_r | step3_r).with_config(run_name="graph_chain")
 
 
 def build_chat_router_chain(vector_rag_chain, graph_rag_chain):
@@ -796,7 +793,7 @@ def build_chat_router_chain(vector_rag_chain, graph_rag_chain):
     return RunnableBranch(
         (lambda query: is_graph_query(query), graph_rag_chain),
         vector_rag_chain,  # default when condition is False
-    ).with_config(run_name="chat_router_chain")
+    ).with_config(run_name="main_route")
 
 
 @traceable(name="chitown_chat_orchestrator")
@@ -810,12 +807,12 @@ def generate_chat_response(user_query: str, chat_chain):
 
 def generate_chat_response_stream(user_query: str, chat_chain):
     """
-    Stream the chat response chunk by chunk. Yields dicts with "answer" and "sources"
-    (cumulative for vector RAG; single chunk for graph RAG).
+    Stream the chat response chunk by chunk. Uses stream_mode="updates" so the LLM
+    streams token deltas; yields dicts with "answer" (delta or full) and/or "sources".
     """
     for chunk in chat_chain.stream(
         user_query,
-        config={"stream_mode": "values"},
+        config={"stream_mode": "updates"},
     ):
         if isinstance(chunk, dict) and ("answer" in chunk or "sources" in chunk):
             yield chunk

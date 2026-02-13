@@ -115,7 +115,9 @@ def main():
         try:
             for chunk in generate_chat_response_stream(prompt_input, chat_chain):
                 if isinstance(chunk, dict):
-                    full_answer = chunk.get("answer") or full_answer
+                    # stream_mode="updates" sends deltas: accumulate answer
+                    if "answer" in chunk and chunk["answer"]:
+                        full_answer += chunk["answer"]
                     if chunk.get("sources") is not None:
                         sources = chunk["sources"]
                 # Show accumulated text with a cursor while streaming

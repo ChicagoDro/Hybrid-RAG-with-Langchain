@@ -60,6 +60,13 @@ SEED_DATA_SQL_PATH = SETUP_DIR / "seed_data.sql"
 DROP_DB_SQL_PATH = SETUP_DIR / "drop_database.sql"
 
 # ------------------------------------------------------------------------------
+# Sales reporting (default period for summaries)
+# ------------------------------------------------------------------------------
+
+SALES_DEFAULT_YEAR = 2024
+SALES_DEFAULT_QUARTER = 3  # 1=Jan–Mar, 2=Apr–Jun, 3=Jul–Sep, 4=Oct–Dec
+
+# ------------------------------------------------------------------------------
 # LangSmith tracing
 # ------------------------------------------------------------------------------
 
