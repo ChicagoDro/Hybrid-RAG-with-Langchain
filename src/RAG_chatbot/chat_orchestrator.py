@@ -865,3 +865,23 @@ def generate_chat_response_stream(user_query: str, chat_chain):
     ):
         if isinstance(chunk, dict) and ("answer" in chunk or "sources" in chunk):
             yield chunk
+
+
+# ---------------------------------------------------------------------------
+# LangSmith run names (hierarchy = parent -> child). run_name -> description.
+# ---------------------------------------------------------------------------
+# main_route                     Top-level router: sends query to kg_chain or vector_chain.
+#   main_route_graph_vs_vector   Routing decision (is_graph_query).
+#   kg_chain                     Full KG RAG pipeline.
+#     kg_build_context           Tool: build graph context for query (person/org/sales).
+#     kg_augment_sales           Tool: add product/marketing vector context when sales.
+#     kg_answer                  Chain: combine context, run LLM, return answer + sources.
+#       kg_generate              Prompt | LLM | parser for final KG answer.
+#   vector_chain                 Full vector RAG pipeline.
+#     vector_classify            Parallel: passthrough query + run doc-type classification.
+#       vector_classify_document_type   Classify query to document category (LLM + parser).
+#     vector_retrieve_step       Invoke retriever with filter from classification; return query + docs.
+#       vector_retrieve          Retriever: fetch docs from vectorstore (optional metadata filter).
+#     vector_format_context      Build context string and sources from retrieved docs.
+#     vector_answer              Parallel: generate answer + passthrough sources.
+#       vector_generate          Prompt | LLM | parser for RAG answer.
