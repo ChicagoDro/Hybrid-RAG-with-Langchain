@@ -182,6 +182,18 @@ Open the URL (e.g. http://localhost:8501). Ask about policies, products, org str
 
 ---
 
+## Future state / To-dos
+
+High-priority improvements (not required for the current demo):
+
+| Item | Rationale |
+|------|-----------|
+| **LangGraph multi-agent or hybrid fusion** | Replace the single-shot `RunnableBranch` with a LangGraph that runs vector and KG retrieval as parallel nodes (or as specialist agents), then a fusion/synthesizer node. State can hold query, vector context, kg context, and draft answer; conditional edges allow “need more context?” loops. Improves coverage for queries that benefit from both sources (e.g. “who sold the most?” plus policy docs). |
+| **Iterative retrieval / query refinement** | Add a LangGraph cycle: generate or expand query → retrieve (vector or KG) → evaluate relevance (LLM or heuristic) → if low, refine query and re-retrieve; if good, generate answer. Reduces “bad query” failures where the first retrieval returns empty or off-target context. |
+| **Evaluation & unit testing** | Unit tests for `is_graph_query`, `build_metadata_filter`, and graph formatting; integration tests for vector and KG chains (output shape, smoke). LangSmith dataset + evaluators (faithfulness, relevance) on a small query set to measure RAG quality and gate regressions. |
+
+---
+
 ## About the Author
 
 **Pete Tamisin** – Technical GTM Leader • AI & Data Engineering Architect • Chicago, IL.
