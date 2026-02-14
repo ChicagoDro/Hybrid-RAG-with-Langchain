@@ -18,7 +18,7 @@ from src.RAG_chatbot.chat_orchestrator import (
     setup_rag_chain,
     load_knowledge_graph,
     build_chat_router_chain,
-    build_graph_rag_chain,
+    build_kg_rag_chain,
     generate_chat_response_stream,
     configure_langsmith,
     get_langsmith_debug_info,
@@ -82,10 +82,10 @@ def main():
         st.error(f"Error loading knowledge graph: {e}")
         st.stop()
 
-    # GraphRAG chain: 3 runnables (build context -> optional vector context -> answer) for clear LangSmith traces
-    graphrag_chain = build_graph_rag_chain(knowledge_graph, vectorstore)
+    # KG RAG chain: 3 runnables (build context -> optional vector context -> answer) for clear LangSmith traces
+    kg_rag_chain = build_kg_rag_chain(knowledge_graph, vectorstore)
 
-    chat_chain = build_chat_router_chain(rag_chain, graphrag_chain)
+    chat_chain = build_chat_router_chain(rag_chain, kg_rag_chain)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []

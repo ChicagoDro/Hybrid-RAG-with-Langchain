@@ -65,13 +65,13 @@ You get a single repo that demonstrates **routing**, **hybrid context** (graph +
 ### LCEL chains
 
 - **Vector RAG:** `RunnableParallel` (classify + passthrough) → `RunnableLambda` (retrieve with scores) → `RunnableParallel` (answer + sources). Each step has a `run_name` for tracing.
-- **Graph RAG:** Three runnables in sequence—**graph_build_context** → **graph_optional_vector_context** → **graph_answer_llm**—so the trace shows exactly where time is spent and what context was added.
+- **KG RAG (knowledge graph):** Three runnables in sequence—**kg_build_context** → **kg_augment_sales** → **kg_answer**—so the trace shows exactly where time is spent and what context was added.
 - **Top level:** `RunnableBranch` between graph and vector chain; `generate_chat_response_stream()` calls `chain.stream()` for streaming.
 
 ### Observability
 
 - **LangSmith:** Set `LANGCHAIN_API_KEY` and `LANGCHAIN_PROJECT` in `.env`; tracing on/off is in `src/config.py` (`LANGCHAIN_TRACING_V2`).
-- **Run names:** Every runnable uses `.with_config(run_name="...")` so traces are readable (e.g. `vector_rag_classify`, `vector_retrieval_with_scores`, `graph_build_context`, `graph_answer_llm`).
+- **Run names:** Every runnable uses `.with_config(run_name="...")` so traces are readable (e.g. `vector_classify`, `vector_retrieve`, `kg_build_context`, `kg_answer`).
 - **Streamlit sidebar:** Optional “Test LangSmith connection” and display of tracing/config state.
 
 ### Streaming

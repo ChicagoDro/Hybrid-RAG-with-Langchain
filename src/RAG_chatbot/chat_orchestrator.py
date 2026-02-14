@@ -28,6 +28,10 @@ from langchain_core.runnables import (
     RunnableParallel,
 )
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.callbacks.manager import CallbackManager
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.runnables.config import RunnableConfig, ensure_config
+from langchain_core.tools import BaseTool
 
 from pydantic import BaseModel, Field
 from langsmith import traceable
@@ -237,6 +241,62 @@ class DocumentCategory(BaseModel):
     )
 
 
+class VectorStoreFilterRetriever(BaseRetriever):
+    """
+    Retriever over the vector store with optional metadata filter from config.
+    Shows as run_type=retriever in LangSmith.
+    """
+    vectorstore: Any
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
+        search_kwargs: Dict[str, Any] = {"k": 3}
+        if metadata_filter:
+            search_kwargs["filter"] = metadata_filter
+        docs_and_scores: List[Tuple[Document, float]] = (
+            self.vectorstore.similarity_search_with_score(query, **search_kwargs)
+        )
+        return [doc for doc, _ in docs_and_scores]
+
+    def invoke(
+        self,
+        input: str,
+        config: Optional[RunnableConfig] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Override to pass metadata_filter from config into retrieval while keeping LangSmith callbacks."""
+        config = ensure_config(config)
+        metadata_filter = config.get("configurable", {}).get("metadata_filter")
+        callback_manager = CallbackManager.configure(
+            config.get("callbacks"),
+            None,
+            verbose=kwargs.get("verbose", False),
+            inheritable_tags=config.get("tags"),
+            local_tags=self.tags,
+            inheritable_metadata=config.get("metadata") or {},
+            local_metadata=self.metadata,
+        )
+        run_manager = callback_manager.on_retriever_start(
+            None,
+            input,
+            name=config.get("run_name") or self.get_name(),
+            run_id=kwargs.pop("run_id", None),
+        )
+        try:
+            result = self._get_relevant_documents(
+                input, metadata_filter=metadata_filter
+            )
+            run_manager.on_retriever_end(result)
+            return result
+        except Exception as e:
+            run_manager.on_retriever_error(e)
+            raise
+
+
 # ----------------------------- RAG CHAIN SETUP -----------------------------------
 
 
@@ -321,81 +381,54 @@ def setup_rag_chain():
             print("[DEBUG] Unknown or missing category; using unfiltered search.")
             return None
 
-    # ---------------- Helper: retrieve docs with scores + build context --------
+    # ---------------- Retriever (run_type=retriever) + format step --------------
 
-    def retrieve_with_scores(inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Upgraded retrieval step:
-        - Uses similarity_search_with_score (so we keep scores)
-        - Applies optional metadata filter from classification
-        - Returns:
-            - query
-            - context (string to feed to LLM)
-            - sources (list of provenance dicts for UI)
-        """
+    # Retriever (run_type=retriever in LangSmith); filter passed via config
+    vector_retriever = VectorStoreFilterRetriever(
+        vectorstore=loaded_vectorstore
+    ).with_config(run_name="vector_retrieve")
+
+    def _invoke_retriever_and_passthrough_query(inputs: Dict[str, Any]) -> Dict[str, Any]:
+        metadata_filter = build_metadata_filter(inputs["classification"])
+        run_config: Dict[str, Any] = {
+            "configurable": {"metadata_filter": metadata_filter}
+        }
+        docs = vector_retriever.invoke(inputs["query"], config=run_config)
+        return {"query": inputs["query"], "docs": docs}
+
+    def _format_docs_to_context(inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """Build context string and sources from retrieved documents."""
         query = inputs["query"]
-        classification = inputs["classification"]
-
-        metadata_filter = build_metadata_filter(classification)
-
-        search_kwargs: Dict[str, Any] = {"k": 3}
-        if metadata_filter:
-            search_kwargs["filter"] = metadata_filter
-
-        print(f"[DEBUG] search_kwargs: {search_kwargs}")
-
-        # Directly use similarity_search_with_score to get scores
-        docs_and_scores: List[Tuple[Document, float]] = (
-            loaded_vectorstore.similarity_search_with_score(
-                query, **search_kwargs
-            )
-        )
-
-        print(
-            f"[DEBUG] Retrieved {len(docs_and_scores)} documents for query '{query}'."
-        )
-
-        # Build context string + source metadata
-        context_chunks: List[str] = []
-        sources: List[Dict[str, Any]] = []
-
-        for i, (doc, score) in enumerate(docs_and_scores):
+        docs: List[Document] = inputs["docs"]
+        context_chunks = []
+        sources = []
+        for i, doc in enumerate(docs):
             file_name = doc.metadata.get("file_name", "Unknown")
             doc_type = doc.metadata.get("document_type", "Unknown")
             page = doc.metadata.get("page", "Unknown")
-            # FAISS scores are distances; lower = closer. Convert to a confidence-ish score:
-            # quick heuristic: confidence = 1 / (1 + distance)
-            distance = float(score)
-            confidence = 1.0 / (1.0 + distance)
-
             context_chunks.append(
-                f"[Source {i+1} | {file_name} | type={doc_type} | page={page} | "
-                f"distance={distance:.4f} | conf≈{confidence:.3f}]\n"
+                f"[Source {i+1} | {file_name} | type={doc_type} | page={page}]\n"
                 f"{doc.page_content}"
             )
-
-            sources.append(
-                {
-                    "id": i + 1,
-                    "file_name": file_name,
-                    "document_type": doc_type,
-                    "page": page,
-                    "distance": distance,
-                    "confidence": confidence,
-                }
-            )
-
+            sources.append({
+                "id": i + 1,
+                "file_name": file_name,
+                "document_type": doc_type,
+                "page": page,
+            })
         context = (
             "\n\n---\n\n".join(context_chunks)
             if context_chunks
             else "No relevant documents found."
         )
+        return {"query": query, "context": context, "sources": sources}
 
-        return {
-            "query": query,
-            "context": context,
-            "sources": sources,
-        }
+    retriever_step = RunnableLambda(_invoke_retriever_and_passthrough_query).with_config(
+        run_name="vector_retrieve_step"
+    )
+    format_docs_step = RunnableLambda(_format_docs_to_context).with_config(
+        run_name="vector_format_context"
+    )
 
     # ---------------- Answer prompt (RAG with context) ---------------------
 
@@ -423,10 +456,6 @@ def setup_rag_chain():
 
     # ---------------- Final LCEL chain (answer + sources) ----------------------
 
-    retriever = RunnableLambda(retrieve_with_scores).with_config(
-        run_name="vector_retrieve"
-    )
-
     classify_and_passthrough = RunnableParallel(
         query=RunnablePassthrough(),
         classification={"query": RunnablePassthrough()} | classification_chain,
@@ -441,7 +470,8 @@ def setup_rag_chain():
 
     rag_chain = (
         classify_and_passthrough
-        | retriever
+        | retriever_step
+        | format_docs_step
         | answer_and_sources
     ).with_config(run_name="vector_chain")
 
@@ -633,7 +663,7 @@ def _is_sales_context(q: str, used_person_summary: bool, used_sales_overview: bo
 # ----------------------------- GRAPH RAG AS LCEL STEPS (for clear LangSmith traces) -------------------
 
 
-@traceable(name="graph_build_context")
+@traceable(name="kg_build_context")
 def _graph_build_context(query: str, G: Any) -> Dict[str, Any]:
     """
     Step 1: Choose and build graph context (person summary, org summary, or sales overview).
@@ -687,7 +717,7 @@ def _graph_build_context(query: str, G: Any) -> Dict[str, Any]:
     }
 
 
-@traceable(name="graph_augment_sales")
+@traceable(name="kg_augment_sales")
 def _graph_add_vector_context(state: Dict[str, Any], vectorstore: Any) -> Dict[str, Any]:
     """
     Step 2: For sales context, optionally add product/marketing vector retrieval.
@@ -710,7 +740,7 @@ def _graph_add_vector_context(state: Dict[str, Any], vectorstore: Any) -> Dict[s
     return {**state, "vector_context": vector_context, "sources": sources}
 
 
-@traceable(name="graph_answer")
+@traceable(name="kg_answer")
 def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Step 3: Combine context, run LLM, return {answer, sources}.
@@ -758,7 +788,7 @@ def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
 
     llm = get_llm()
     chain = (graph_prompt | llm | StrOutputParser()).with_config(
-        run_name="graph_generate"
+        run_name="kg_generate"
     )
     answer_text = chain.invoke(
         {"query": state["user_query"], "graph_context": combined}
@@ -766,32 +796,51 @@ def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
     return {"answer": answer_text, "sources": sources}
 
 
-def build_graph_rag_chain(G: Any, vectorstore: Any = None):
+class GraphBuildContextTool(BaseTool):
+    """Build graph context for a query. Shows as run_type=tool in LangSmith."""
+    name: str = "kg_build_context"
+    description: str = "Build context from the knowledge graph for the given query."
+    G: Any = None
+
+    def _run(self, query: str, **kwargs: Any) -> Dict[str, Any]:
+        return _graph_build_context(query, self.G)
+
+
+class GraphAugmentSalesTool(BaseTool):
+    """Augment graph state with vector/sales context. Shows as run_type=tool in LangSmith."""
+    name: str = "kg_augment_sales"
+    description: str = "Augment graph context with product/marketing docs when relevant."
+    vectorstore: Any = None
+
+    def _run(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        state = args[0] if args else kwargs.get("state", kwargs)
+        if not isinstance(state, dict):
+            state = kwargs
+        return _graph_add_vector_context(state, self.vectorstore)
+
+
+def build_kg_rag_chain(G: Any, vectorstore: Any = None):
     """
-    Build the GraphRAG chain as 3 runnables so LangSmith shows distinct steps:
-      graph_build_context -> graph_optional_vector_context -> graph_answer_llm
+    Build the knowledge-graph RAG chain as 3 runnables so LangSmith shows distinct steps:
+      kg_build_context (tool) -> kg_augment_sales (tool) -> kg_answer (chain)
     """
-    def step1(query: str) -> Dict[str, Any]:
-        return _graph_build_context(query, G)
+    step1_r = GraphBuildContextTool(G=G).with_config(run_name="kg_build_context")
+    step2_r = GraphAugmentSalesTool(vectorstore=vectorstore).with_config(
+        run_name="kg_augment_sales"
+    )
+    step3_r = RunnableLambda(_graph_answer_llm).with_config(run_name="kg_answer")
 
-    def step2(state: Dict[str, Any]) -> Dict[str, Any]:
-        return _graph_add_vector_context(state, vectorstore)
-
-    step1_r = RunnableLambda(step1).with_config(run_name="graph_build_context")
-    step2_r = RunnableLambda(step2).with_config(run_name="graph_augment_sales")
-    step3_r = RunnableLambda(_graph_answer_llm).with_config(run_name="graph_answer")
-
-    return (step1_r | step2_r | step3_r).with_config(run_name="graph_chain")
+    return (step1_r | step2_r | step3_r).with_config(run_name="kg_chain")
 
 
-def build_chat_router_chain(vector_rag_chain, graph_rag_chain):
+def build_chat_router_chain(vector_rag_chain, kg_rag_chain):
     """
-    LCEL router that sends queries either to the GraphRAG chain
+    LCEL router that sends queries either to the knowledge-graph RAG chain
     or to the vector-based RAG chain.
     RunnableBranch expects (condition, runnable) pairs and a final default runnable.
     """
     return RunnableBranch(
-        (lambda query: is_graph_query(query), graph_rag_chain),
+        (lambda query: is_graph_query(query), kg_rag_chain),
         vector_rag_chain,  # default when condition is False
     ).with_config(run_name="main_route")
 
