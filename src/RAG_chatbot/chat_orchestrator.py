@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Literal, Optional, Tuple
 from operator import itemgetter
 
 import sys
@@ -241,6 +241,20 @@ class DocumentCategory(BaseModel):
     )
 
 
+class RouteDecision(BaseModel):
+    """LLM routing decision: which RAG path and (for KG) which context type. Editable in LangSmith Playground."""
+    route: Literal["vector", "kg_org", "kg_sales"] = Field(
+        description=(
+            "Use 'vector' for questions answered by company documents: return policy, HR policy, "
+            "customer service, products, marketing, operations, anything from PDFs.\n"
+            "Use 'kg_org' for org structure only: org chart, who works here, who reports to whom, "
+            "headcount, CEO/founder, departments—no sales numbers.\n"
+            "Use 'kg_sales' for sales performance and numbers: who sold the most, top seller, "
+            "best salesperson, revenue, Q3 sales, monthly sales, sold, sales by person/department."
+        )
+    )
+
+
 class VectorStoreFilterRetriever(BaseRetriever):
     """
     Retriever over the vector store with optional metadata filter from config.
@@ -394,7 +408,10 @@ def setup_rag_chain():
             "configurable": {"metadata_filter": metadata_filter}
         }
         docs = vector_retriever.invoke(inputs["query"], config=run_config)
-        return {"query": inputs["query"], "docs": docs}
+        out: Dict[str, Any] = {"query": inputs["query"], "docs": docs}
+        if "language" in inputs:
+            out["language"] = inputs["language"]
+        return out
 
     def _format_docs_to_context(inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Build context string and sources from retrieved documents."""
@@ -421,7 +438,10 @@ def setup_rag_chain():
             if context_chunks
             else "No relevant documents found."
         )
-        return {"query": query, "context": context, "sources": sources}
+        out: Dict[str, Any] = {"query": query, "context": context, "sources": sources}
+        if "language" in inputs:
+            out["language"] = inputs["language"]
+        return out
 
     retriever_step = RunnableLambda(_invoke_retriever_and_passthrough_query).with_config(
         run_name="vector_retrieve_step"
@@ -442,7 +462,8 @@ def setup_rag_chain():
                     "Answer ONLY using the information in the 'Context' below. "
                     "If the answer is not clearly supported by the context, say that you "
                     "cannot answer from the shop documents.\n\n"
-                    "Keep your tone friendly, clear, and grounded in the provided text."
+                    "Keep your tone friendly, clear, and grounded in the provided text.\n\n"
+                    #"Response language: {language}"
                 ),
             ),
             (
@@ -453,13 +474,25 @@ def setup_rag_chain():
             ),
         ]
     )
+    #client = LangSmithClient(api_key=os.getenv("LANGCHAIN_API_KEY"))
+    #ANSWER_PROMPT = client.pull_prompt(
+    #    "chitown-chatbot-vector"
+    #)
+    # ---------------- Normalize input (dict with query + language) and classify ----------------------
 
-    # ---------------- Final LCEL chain (answer + sources) ----------------------
+    def _classify_and_passthrough(inp: Any) -> Dict[str, Any]:
+        if isinstance(inp, dict):
+            query = inp.get("query", "")
+            language = inp.get("language", "English")
+        else:
+            query = inp
+            language = "English"
+        classification = classification_chain.invoke({"query": query})
+        return {"query": query, "classification": classification, "language": language}
 
-    classify_and_passthrough = RunnableParallel(
-        query=RunnablePassthrough(),
-        classification={"query": RunnablePassthrough()} | classification_chain,
-    ).with_config(run_name="vector_classify")
+    classify_and_passthrough = RunnableLambda(_classify_and_passthrough).with_config(
+        run_name="vector_classify"
+    )
 
     answer_and_sources = RunnableParallel(
         answer=(ANSWER_PROMPT | llm | StrOutputParser()).with_config(
@@ -663,50 +696,70 @@ def _is_sales_context(q: str, used_person_summary: bool, used_sales_overview: bo
 # ----------------------------- GRAPH RAG AS LCEL STEPS (for clear LangSmith traces) -------------------
 
 
-@traceable(name="kg_build_context")
-def _graph_build_context(query: str, G: Any) -> Dict[str, Any]:
+def _graph_build_context(
+    query: str,
+    G: Any,
+    kg_context: Optional[Literal["kg_org", "kg_sales"]] = None,
+    language: str = "English",
+) -> Dict[str, Any]:
     """
-    Step 1: Choose and build graph context (person summary, org summary, or sales overview).
+    Step 1: Build graph context (person summary, org summary, or sales overview).
+    When kg_context is set by the router LLM, use it; otherwise fall back to keyword logic.
     Returns state dict for the next runnable.
     """
     q = query.lower()
     used_person_summary = False
     used_sales_overview = False
 
-    person_id = None
-    for person in list_people(G):
-        if person["name"].lower() in q:
-            person_id = person["id"]
-            break
-
-    if person_id:
-        graph_context = format_person_sales_summary(G, person_id)
-        used_person_summary = True
-    elif (
-        "org chart" in q
-        or "org structure" in q
-        or "organization" in q
-        or "who works there" in q
-        or "headcount" in q
-        or "who works at" in q
-    ):
-        graph_context = format_org_summary(G)
-    elif any(
-        phrase in q
-        for phrase in (
-            "sales",
-            "revenue",
-            "figures",
-            "performance",
-            "numbers",
-            "q3",
-            "total sales",
-        )
-    ):
+    # Router LLM decided kg_org vs kg_sales: use it (no brittle keyword list)
+    if kg_context == "kg_sales":
         graph_context = format_sales_overview(G)
         used_sales_overview = True
-    else:
+    elif kg_context == "kg_org":
         graph_context = format_org_summary(G)
+    else:
+        # Fallback when chain is invoked without kg_context (e.g. tests)
+        person_id = None
+        for person in list_people(G):
+            if person["name"].lower() in q:
+                person_id = person["id"]
+                break
+
+        if person_id:
+            graph_context = format_person_sales_summary(G, person_id)
+            used_person_summary = True
+        elif any(
+            phrase in q
+            for phrase in (
+                "org chart",
+                "org structure",
+                "organization",
+                "who works there",
+                "headcount",
+                "who works at",
+            )
+        ):
+            graph_context = format_org_summary(G)
+        elif any(
+            phrase in q
+            for phrase in (
+                "sales",
+                "revenue",
+                "figures",
+                "performance",
+                "numbers",
+                "q3",
+                "total sales",
+                "sold",
+                "most",
+                "top",
+                "best",
+            )
+        ):
+            graph_context = format_sales_overview(G)
+            used_sales_overview = True
+        else:
+            graph_context = format_org_summary(G)
 
     return {
         "user_query": query,
@@ -714,10 +767,10 @@ def _graph_build_context(query: str, G: Any) -> Dict[str, Any]:
         "graph_context": graph_context,
         "used_person_summary": used_person_summary,
         "used_sales_overview": used_sales_overview,
+        "language": language,
     }
 
 
-@traceable(name="kg_augment_sales")
 def _graph_add_vector_context(state: Dict[str, Any], vectorstore: Any) -> Dict[str, Any]:
     """
     Step 2: For sales context, optionally add product/marketing vector retrieval.
@@ -740,7 +793,6 @@ def _graph_add_vector_context(state: Dict[str, Any], vectorstore: Any) -> Dict[s
     return {**state, "vector_context": vector_context, "sources": sources}
 
 
-@traceable(name="kg_answer")
 def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Step 3: Combine context, run LLM, return {answer, sources}.
@@ -763,6 +815,7 @@ def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
         combined = graph_context
         system_extra = ""
 
+    language = state.get("language", "English")
     graph_prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -774,7 +827,8 @@ def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
                     + system_extra
                     + "\n\n"
                     "Use the information below when answering. If the context "
-                    "does not clearly support an answer, say so."
+                    "does not clearly support an answer, say so.\n\n"
+                    #"Response language: {language}\n\n"
                 ),
             ),
             (
@@ -791,7 +845,7 @@ def _graph_answer_llm(state: Dict[str, Any]) -> Dict[str, Any]:
         run_name="kg_generate"
     )
     answer_text = chain.invoke(
-        {"query": state["user_query"], "graph_context": combined}
+        {"query": state["user_query"], "graph_context": combined, "language": language}
     )
     return {"answer": answer_text, "sources": sources}
 
@@ -802,8 +856,14 @@ class GraphBuildContextTool(BaseTool):
     description: str = "Build context from the knowledge graph for the given query."
     G: Any = None
 
-    def _run(self, query: str, **kwargs: Any) -> Dict[str, Any]:
-        return _graph_build_context(query, self.G)
+    def _run(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        inp = args[0] if args else kwargs.get("query", kwargs)
+        if isinstance(inp, dict):
+            query = inp.get("query", "")
+            kg_context = inp.get("kg_context")  # kg_org | kg_sales from router
+            language = inp.get("language", "English")
+            return _graph_build_context(query, self.G, kg_context=kg_context, language=language)
+        return _graph_build_context(inp, self.G, kg_context=None)
 
 
 class GraphAugmentSalesTool(BaseTool):
@@ -835,32 +895,99 @@ def build_kg_rag_chain(G: Any, vectorstore: Any = None):
 
 def build_chat_router_chain(vector_rag_chain, kg_rag_chain):
     """
-    LCEL router that sends queries either to the knowledge-graph RAG chain
-    or to the vector-based RAG chain.
-    RunnableBranch expects (condition, runnable) pairs and a final default runnable.
+    LLM-based router: one prompt + LLM + parser decides kg vs vector.
+    The routing run appears as main_route_llm in the trace so you can open it in
+    LangSmith Playground, fix the prompt when the path is wrong, and save.
     """
-    return RunnableBranch(
-        (lambda query: is_graph_query(query), kg_rag_chain),
-        vector_rag_chain,  # default when condition is False
+    llm = get_llm()
+    route_parser = JsonOutputParser(pydantic_object=RouteDecision)
+    route_format = route_parser.get_format_instructions()
+
+    ROUTER_PROMPT = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a router for Chitown Custom Choppers, a bicycle shop.\n\n"
+                "Choose the single best backend for this user query. Use semantic understanding "
+                "(e.g. 'sold' and 'sales' are related; 'who sold the most' needs sales data).\n\n"
+                "- **vector**: Policies, documents, returns, HR, customer service, products, "
+                "marketing, operations—anything answered from company documents or PDFs.\n\n"
+                "- **kg_org**: Org structure only—org chart, who works here, who reports to whom, "
+                "headcount, CEO/founder, departments. No sales figures.\n\n"
+                "- **kg_sales**: Sales performance and numbers—who sold the most, top seller, "
+                "revenue, Q3 sales, monthly sales, sold, sales by person or department.\n\n"
+                "Return ONLY valid JSON per these instructions:\n"
+                "{format_instructions}"
+            ),
+            ("human", "User query: {query}"),
+        ]
+    ).partial(format_instructions=route_format)
+
+    router_chain = (
+        ROUTER_PROMPT | llm | route_parser
+    ).with_config(run_name="main_route_llm")
+
+    def router_step(inp: Any) -> Dict[str, Any]:
+        if isinstance(inp, dict):
+            query = inp.get("query", "")
+            language = inp.get("language", "English")
+        else:
+            query = inp
+            language = "English"
+        decision = router_chain.invoke({"query": query})
+        route = (
+            decision.route
+            if isinstance(decision, RouteDecision)
+            else decision.get("route", "vector")
+        )
+        return {"query": query, "route": route, "language": language}
+
+    def run_chosen_path(inp: Dict[str, Any]) -> Dict[str, Any]:
+        route = inp.get("route", "vector")
+        language = inp.get("language", "English")
+        if route == "vector":
+            return vector_rag_chain.invoke({"query": inp["query"], "language": language})
+        # kg_org or kg_sales: pass kg_context so the KG chain uses the right context type
+        return kg_rag_chain.invoke({
+            "query": inp["query"],
+            "kg_context": route,
+            "language": language,
+        })
+
+    return (
+        RunnableLambda(router_step).with_config(run_name="main_route_router")
+        | RunnableLambda(run_chosen_path).with_config(run_name="main_route_execute")
     ).with_config(run_name="main_route")
 
 
+def _normalize_chat_input(user_input: Any) -> Dict[str, Any]:
+    """Accept string or dict; return dict with query and language."""
+    if isinstance(user_input, dict):
+        return {
+            "query": user_input.get("query", ""),
+            "language": user_input.get("language", "English"),
+        }
+    return {"query": user_input, "language": "English"}
+
+
 @traceable(name="chitown_chat_orchestrator")
-def generate_chat_response(user_query: str, chat_chain):
+def generate_chat_response(user_input: Any, chat_chain):
     """
     Top-level orchestrator for a single user query (non-streaming).
-    This function is annotated for LangSmith tracing.
+    user_input can be a string (query only) or dict with "query" and optional "language".
     """
-    return chat_chain.invoke(user_query)
+    return chat_chain.invoke(_normalize_chat_input(user_input))
 
 
-def generate_chat_response_stream(user_query: str, chat_chain):
+def generate_chat_response_stream(user_input: Any, chat_chain):
     """
     Stream the chat response chunk by chunk. Uses stream_mode="updates" so the LLM
     streams token deltas; yields dicts with "answer" (delta or full) and/or "sources".
+    user_input can be a string (query only) or dict with "query" and optional "language".
     """
+    inp = _normalize_chat_input(user_input)
     for chunk in chat_chain.stream(
-        user_query,
+        inp,
         config={"stream_mode": "updates"},
     ):
         if isinstance(chunk, dict) and ("answer" in chunk or "sources" in chunk):
@@ -870,18 +997,20 @@ def generate_chat_response_stream(user_query: str, chat_chain):
 # ---------------------------------------------------------------------------
 # LangSmith run names (hierarchy = parent -> child). run_name -> description.
 # ---------------------------------------------------------------------------
-# main_route                     Top-level router: sends query to kg_chain or vector_chain.
-#   main_route_graph_vs_vector   Routing decision (is_graph_query).
-#   kg_chain                     Full KG RAG pipeline.
-#     kg_build_context           Tool: build graph context for query (person/org/sales).
-#     kg_augment_sales           Tool: add product/marketing vector context when sales.
-#     kg_answer                  Chain: combine context, run LLM, return answer + sources.
-#       kg_generate              Prompt | LLM | parser for final KG answer.
-#   vector_chain                 Full vector RAG pipeline.
-#     vector_classify            Parallel: passthrough query + run doc-type classification.
-#       vector_classify_document_type   Classify query to document category (LLM + parser).
-#     vector_retrieve_step       Invoke retriever with filter from classification; return query + docs.
-#       vector_retrieve          Retriever: fetch docs from vectorstore (optional metadata filter).
-#     vector_format_context      Build context string and sources from retrieved docs.
-#     vector_answer              Parallel: generate answer + passthrough sources.
-#       vector_generate          Prompt | LLM | parser for RAG answer.
+# main_route                     Top-level: LLM router then execute chosen path.
+#   main_route_router            Runs router step (query -> route decision).
+#     main_route_llm             Prompt | LLM | parser for route (vector | kg_org | kg_sales). Edit in Playground.
+#   main_route_execute           Invokes kg_chain or vector_chain from route.
+#     kg_chain                   Full KG RAG pipeline (when route=kg).
+#       kg_build_context         Tool: build graph context for query (person/org/sales).
+#       kg_augment_sales         Tool: add product/marketing vector context when sales.
+#       kg_answer                Chain: combine context, run LLM, return answer + sources.
+#         kg_generate            Prompt | LLM | parser for final KG answer.
+#     vector_chain               Full vector RAG pipeline (when route=vector).
+#       vector_classify          Parallel: passthrough query + run doc-type classification.
+#         vector_classify_document_type   Classify query to document category (LLM + parser).
+#       vector_retrieve_step     Invoke retriever with filter from classification; return query + docs.
+#         vector_retrieve        Retriever: fetch docs from vectorstore (optional metadata filter).
+#       vector_format_context    Build context string and sources from retrieved docs.
+#       vector_answer            Parallel: generate answer + passthrough sources.
+#         vector_generate        Prompt | LLM | parser for RAG answer.

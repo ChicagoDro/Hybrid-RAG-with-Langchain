@@ -68,6 +68,13 @@ def main():
                     st.error(result["message"])
                     if result.get("detail"):
                         st.code(result["detail"][:500], language=None)
+        st.divider()
+        answer_language = st.selectbox(
+            "Answer language",
+            options=["English", "Spanish", "French"],
+            index=0,
+            key="answer_language",
+        )
 
     # Initialize RAG and GraphRAG resources (cached)
     try:
@@ -113,7 +120,9 @@ def main():
         full_answer = ""
         sources = []
         try:
-            for chunk in generate_chat_response_stream(prompt_input, chat_chain):
+            for chunk in generate_chat_response_stream(
+                {"query": prompt_input, "language": answer_language}, chat_chain
+            ):
                 if isinstance(chunk, dict):
                     # stream_mode="updates" sends deltas: accumulate answer
                     if "answer" in chunk and chunk["answer"]:
@@ -127,16 +136,19 @@ def main():
             st.error(f"Error generating response: {e}")
             return
 
-        # Show provenance block for vector-RAG answers
+        # Show provenance block for RAG answers (vector and graph paths)
         if sources:
             st.markdown("---")
             st.markdown("**Sources used:**")
             for s in sources:
-                st.markdown(
-                    f"- Source {s['id']}: `{s['file_name']}` "
-                    f"(type: {s['document_type']}, page: {s['page']}, "
-                    f"distance={s['distance']:.4f}, conf≈{s['confidence']:.3f})"
+                line = (
+                    f"- Source {s.get('id', '?')}: `{s.get('file_name', 'Unknown')}` "
+                    f"(type: {s.get('document_type', 'Unknown')}, page: {s.get('page', '?')}"
                 )
+                if s.get("distance") is not None and s.get("confidence") is not None:
+                    line += f", distance={s['distance']:.4f}, conf≈{s['confidence']:.3f}"
+                line += ")"
+                st.markdown(line)
 
     # Store assistant answer in history (just the text, not the sources block)
     st.session_state.messages.append({"role": "assistant", "content": full_answer})
